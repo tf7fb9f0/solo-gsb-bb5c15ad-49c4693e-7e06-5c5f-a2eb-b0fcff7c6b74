@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>字幕位置规划</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>字幕位置规划</h1>
+  <p class="sub">粘贴 SRT 字幕并给出画面上方/下方被遮挡的时间段，系统先把同侧重叠遮挡时段求并集，再以「总遮挡时长 + 相邻字幕上下换位代价」最小为目标逐条选择位置（同分优先下方），导出带 line 位置设置的 WebVTT。</p>
+  <p class="nav"><a href="/">← 返回时间漂移校正</a></p>
+
+  <div class="card">
+    <label for="srt">原始 SRT 字幕</label>
+    <textarea id="srt" placeholder="1&#10;00:00:05,000 --> 00:00:08,000&#10;第一句字幕&#10;&#10;2&#10;00:00:12,000 --> 00:00:15,500&#10;第二句字幕"></textarea>
+  </div>
+
+  <div class="card">
+    <h2>画面上方遮挡时段
+      <span class="hint">重叠或首尾相接的时段会自动合并；时间格式 HH:MM:SS,mmm</span>
+    </h2>
+    <table class="blocks">
+      <thead>
+        <tr>
+          <th style="width:46%">开始</th>
+          <th style="width:30px"></th>
+          <th style="width:46%">结束</th>
+          <th style="width:44px"></th>
+        </tr>
+      </thead>
+      <tbody id="topRows"></tbody>
+    </table>
+    <div class="toolbar" style="margin-top:6px;">
+      <button type="button" id="addTop">+ 添加上方时段</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>画面下方遮挡时段
+      <span class="hint">可留空；结束时间必须严格晚于开始时间</span>
+    </h2>
+    <table class="blocks">
+      <thead>
+        <tr>
+          <th style="width:46%">开始</th>
+          <th style="width:30px"></th>
+          <th style="width:46%">结束</th>
+          <th style="width:44px"></th>
+        </tr>
+      </thead>
+      <tbody id="bottomRows"></tbody>
+    </table>
+    <div class="toolbar" style="margin-top:6px;">
+      <button type="button" id="addBottom">+ 添加下方时段</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label for="switchCost">相邻字幕上下换位代价（毫秒，非负整数）</label>
+    <div class="cost-row">
+      <input type="number" id="switchCost" min="0" step="1" value="1000">
+      <span class="hint">越大越倾向让连续字幕待在同一侧；0 表示只看遮挡时长。</span>
+    </div>
+  </div>
+
+  <div id="errorBox" class="alert error hidden"></div>
+
+  <div class="toolbar" style="margin-bottom: 20px;">
+    <button type="button" class="primary" id="submit">规划位置</button>
+    <button type="button" id="fillExample">填入示例</button>
+    <span class="hint" id="status"></span>
+  </div>
+
+  <div id="resultCard" class="card hidden">
+    <h2>规划结果</h2>
+    <div id="okBox" class="alert ok hidden"></div>
+    <div id="occludedBox" class="alert warn hidden"></div>
+    <p class="summary" id="summary"></p>
+    <div class="toolbar" style="margin-top:0;">
+      <button type="button" class="primary" id="download">下载 placement.vtt</button>
+    </div>
+    <table class="cues">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>时间轴</th>
+          <th>所选位置</th>
+          <th>上方遮挡 (ms)</th>
+          <th>下方遮挡 (ms)</th>
+          <th>所选位置遮挡 (ms)</th>
+          <th>文本</th>
+        </tr>
+      </thead>
+      <tbody id="cueTable"></tbody>
+    </table>
+    <h2 style="margin-top:18px;">WebVTT 预览</h2>
+    <pre class="preview" id="preview"></pre>
+  </div>
+</div>
+
+<script>
+(function () {
+  const srtEl = document.getElementById("srt");
+  const costEl = document.getElementById("switchCost");
+  const topRowsEl = document.getElementById("topRows");
+  const bottomRowsEl = document.getElementById("bottomRows");
+  const errorBox = document.getElementById("errorBox");
+  const resultCard = document.getElementById("resultCard");
+  const previewEl = document.getElementById("preview");
+  const cueTableEl = document.getElementById("cueTable");
+  const okBox = document.getElementById("okBox");
+  const occludedBox = document.getElementById("occludedBox");
+  const summaryEl = document.getElementById("summary");
+  const statusEl = document.getElementById("status");
+
+  function addRow(tbody, start, end) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="time"><input type="text" class="start" placeholder="00:00:06,000" spellcheck="false"></td>' +
+      '<td class="op">→</td>' +
+      '<td class="time"><input type="text" class="end" placeholder="00:00:09,000" spellcheck="false"></td>' +
+      '<td class="del"><button type="button" class="danger-link" title="删除该时段">删除</button></td>';
+    tr.querySelector(".start").value = start || "";
+    tr.querySelector(".end").value = end || "";
+    tr.querySelector(".danger-link").addEventListener("click", () => tr.remove());
+    tbody.appendChild(tr);
+  }
+
+  function collectBlocks(tbody) {
+    const blocks = [];
+    for (const tr of tbody.querySelectorAll("tr")) {
+      const start = tr.querySelector(".start").value.trim();
+      const end = tr.querySelector(".end").value.trim();
+      // 起止都为空视为不填；只填一侧则原样提交，由服务端报错
+      if (start === "" && end === "") continue;
+      blocks.push({ start: start, end: end });
+    }
+    return blocks;
+  }
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.classList.remove("hidden");
+  }
+  function clearAlerts() {
+    errorBox.classList.add("hidden");
+    okBox.classList.add("hidden");
+    occludedBox.classList.add("hidden");
+    errorBox.textContent = "";
+  }
+
+  // FastAPI 校验失败时 detail 可能是 [{msg,loc,...}] 数组（如换位代价非整数）；
+  // 业务校验失败时 detail 是 {type, message} 对象，这里两种都转成可读文案
+  function describeErrorDetail(detail) {
+    if (detail && typeof detail === "object" && !Array.isArray(detail) && detail.message) {
+      return detail.message;
+    }
+    if (Array.isArray(detail)) {
+      const parts = detail
+        .filter(d => d && d.msg)
+        .map(d => (d.loc && d.loc.length ? d.loc.join(".") + "：" : "") + d.msg);
+      if (parts.length) return parts.join("\n");
+    }
+    return "";
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  document.getElementById("addTop").addEventListener("click", () => addRow(topRowsEl));
+  document.getElementById("addBottom").addEventListener("click", () => addRow(bottomRowsEl));
+
+  const EXAMPLE_SRT =
+    "1\n00:00:05,000 --> 00:00:09,000\n上方台标正好挡住的第一句\n\n" +
+    "2\n00:00:10,000 --> 00:00:14,000\n两侧都可能被挡的第二句\n\n" +
+    "3\n00:00:16,000 --> 00:00:20,000\n下方滚动字幕挡住的第三句\n";
+
+  document.getElementById("fillExample").addEventListener("click", () => {
+    srtEl.value = EXAMPLE_SRT;
+    topRowsEl.innerHTML = "";
+    bottomRowsEl.innerHTML = "";
+    // 上方两段重叠：05–08 与 06–09 求并集为 05–09
+    addRow(topRowsEl, "00:00:05,000", "00:00:08,000");
+    addRow(topRowsEl, "00:00:06,000", "00:00:09,000");
+    addRow(topRowsEl, "00:00:11,000", "00:00:13,000");
+    addRow(bottomRowsEl, "00:00:11,000", "00:00:19,000");
+    costEl.value = "1000";
+    clearAlerts();
+    resultCard.classList.add("hidden");
+  });
+
+  document.getElementById("submit").addEventListener("click", async () => {
+    clearAlerts();
+    resultCard.classList.add("hidden");
+
+    // 换位代价先做一轮前端预校验（服务端仍会按非负整数严格校验）
+    const costRaw = costEl.value.trim();
+    if (!/^\d+$/.test(costRaw)) {
+      showError("相邻字幕上下换位代价必须是非负整数（毫秒），不能填写小数、负数或其他字符。");
+      return;
+    }
+
+    const body = {
+      srt: srtEl.value,
+      top_blocks: collectBlocks(topRowsEl),
+      bottom_blocks: collectBlocks(bottomRowsEl),
+      switch_cost_ms: parseInt(costRaw, 10)
+    };
+
+    statusEl.textContent = "规划中…";
+    try {
+      const resp = await fetch("/api/placement", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError(describeErrorDetail(data.detail) || ("请求失败（HTTP " + resp.status + "）"));
+        statusEl.textContent = "";
+        return;
+      }
+
+      // 页面预览与下载共用同一份服务端返回的 WebVTT
+      window.__placementVtt = data.webvtt;
+      previewEl.textContent = window.__placementVtt;
+      cueTableEl.innerHTML = data.cues.map(c => {
+        const badge = c.position === "top"
+          ? '<span class="badge top">上方</span>'
+          : '<span class="badge bottom">下方</span>';
+        return "<tr" + (c.chosen_blocked_ms > 0 ? ' class="occluded"' : "") + ">" +
+          '<td class="num">' + escapeHtml(c.index) + "</td>" +
+          '<td class="tc">' + escapeHtml(c.start) + "<br>" + escapeHtml(c.end) + "</td>" +
+          "<td>" + badge + "</td>" +
+          '<td class="ms">' + c.top_blocked_ms + "</td>" +
+          '<td class="ms">' + c.bottom_blocked_ms + "</td>" +
+          '<td class="ms">' + c.chosen_blocked_ms + "</td>" +
+          "<td>" + escapeHtml(c.text).replace(/\n/g, "<br>") + "</td>" +
+          "</tr>";
+      }).join("");
+
+      summaryEl.innerHTML =
+        "共规划 <code>" + data.cues.length + "</code> 条字幕；" +
+        "所选位置遮挡合计 <code>" + data.total_blocked_ms + "</code> ms，" +
+        "换位 <code>" + data.switch_count + "</code> 次，" +
+        "换位代价合计 <code>" + data.total_switch_cost_ms + "</code> ms。";
+
+      if (data.occluded_indices.length) {
+        occludedBox.textContent =
+          "以下 " + data.occluded_indices.length + " 条字幕即使换到所选位置仍被遮挡" +
+          "（表中红色行）：序号 " + data.occluded_indices.map(escapeHtml).join("、") +
+          "。建议另行调整画面元素或字幕样式。";
+        occludedBox.classList.remove("hidden");
+      } else {
+        okBox.textContent = "全部字幕在所选位置上均不被遮挡。";
+        okBox.classList.remove("hidden");
+      }
+      resultCard.classList.remove("hidden");
+      statusEl.textContent = "";
+    } catch (err) {
+      showError("请求出错：" + err);
+      statusEl.textContent = "";
+    }
+  });
+
+  document.getElementById("download").addEventListener("click", () => {
+    const content = window.__placementVtt || "";
+    const blob = new Blob([content], { type: "text/vtt;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "placement.vtt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>

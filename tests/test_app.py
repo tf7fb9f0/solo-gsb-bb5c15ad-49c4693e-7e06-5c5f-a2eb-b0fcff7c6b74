@@ -1,10 +1,20 @@
 """核心算法与 FastAPI 接口测试。"""
+import itertools
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.mapping import AnchorError, PiecewiseMapping, build_anchors
-from app.srt import BOM, SrtParseError, format_srt, parse_srt, rewrite_srt
+from app.placement import (
+    BOTTOM,
+    TOP,
+    merge_intervals,
+    overlap_duration,
+    plan_positions,
+    render_webvtt,
+)
+from app.srt import BOM, SrtParseError, Cue, format_srt, parse_srt, rewrite_srt
 from app.timecode import format_timecode, parse_timecode
 
 client = TestClient(app)
@@ -308,5 +318,293 @@ def test_api_rejects_bad_srt():
     body = request_body()
     body["srt"] = "garbage without timing"
     resp = client.post("/api/correct", json=body)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+# ---------- 位置规划：区间并集与遮挡时长 ----------
+
+def test_merge_intervals_overlapping_and_adjacent():
+    # 重叠合并
+    assert merge_intervals([(1000, 3000), (2000, 5000)]) == [(1000, 5000)]
+    # 首尾相接（start == 上一段 end）也合并
+    assert merge_intervals([(1000, 3000), (3000, 5000)]) == [(1000, 5000)]
+    # 乱序输入先排序
+    assert merge_intervals([(9000, 9500), (1000, 2000), (3000, 4000)]) == [
+        (1000, 2000),
+        (3000, 4000),
+        (9000, 9500),
+    ]
+    # 包含关系不外扩
+    assert merge_intervals([(1000, 9000), (2000, 3000)]) == [(1000, 9000)]
+    assert merge_intervals([]) == []
+
+
+def test_overlap_duration_with_union():
+    union = [(1000, 3000), (5000, 8000)]
+    # 字幕 [0, 9000)：2000 + 3000 = 5000
+    assert overlap_duration(0, 9000, union) == 5000
+    # 字幕 [2000, 6000)：1000 + 1000 = 2000
+    assert overlap_duration(2000, 6000, union) == 2000
+    # 完全落在遮挡内
+    assert overlap_duration(5500, 7000, union) == 1500
+    # 仅端点相接不算交集（半开区间）
+    assert overlap_duration(3000, 5000, union) == 0
+    # 完全不相交
+    assert overlap_duration(9000, 10_000, union) == 0
+    assert overlap_duration(0, 1000, []) == 0
+
+
+# ---------- 位置规划：动态规划选位 ----------
+
+def _brute_force_optimal(top_ms, bottom_ms, switch_cost):
+    """枚举所有上下方案，返回 (最小代价, 该代价下最“下方优先”的方案元组)。"""
+    n = len(top_ms)
+    best_cost = None
+    best_sides = None
+    for sides in itertools.product((BOTTOM, TOP), repeat=n):
+        cost = sum(top_ms[i] if sides[i] == TOP else bottom_ms[i] for i in range(n))
+        cost += sum(switch_cost for a, b in zip(sides, sides[1:]) if a != b)
+        if best_cost is None or cost < best_cost or (
+            cost == best_cost and sides < best_sides
+        ):
+            best_cost = cost
+            best_sides = sides
+    return best_cost, list(best_sides)
+
+
+def test_plan_prefers_bottom_on_tie():
+    # 两侧遮挡完全相同：无论换位代价多少，全部待在下方且零换位最优
+    top = [1000, 1000, 1000]
+    bottom = [1000, 1000, 1000]
+    sides, chosen = plan_positions(top, bottom, 500)
+    assert sides == [BOTTOM, BOTTOM, BOTTOM]
+    assert chosen == [1000, 1000, 1000]
+
+
+def test_plan_no_switch_cost_picks_per_cue_minimum_bottom_tie():
+    top = [5000, 100, 2000, 300]
+    bottom = [100, 4000, 2000, 900]
+    sides, _ = plan_positions(top, bottom, 0)
+    # 第 0 条下更优；第 1 条上更优；第 2 条同分选下方；第 3 条上更优
+    assert sides == [BOTTOM, TOP, BOTTOM, TOP]
+
+
+def test_plan_pays_switch_only_when_occlusion_savings_exceed_it():
+    # 单条：上方 100、下方 2000，换位代价 10000 也应选上方（第一条无前序换位代价）
+    sides, chosen = plan_positions([100], [2000], 10_000)
+    assert sides == [TOP]
+    assert chosen == [100]
+
+    # 两条：第一条下（0），第二条上只省 800 遮挡却要 1000 换位 → 留下
+    sides, chosen = plan_positions([1000, 1000], [0, 1800], 1000)
+    assert sides == [BOTTOM, BOTTOM]
+    assert chosen == [0, 1800]
+
+    # 换位代价降到 500：省下 800 > 500，第二条换上方
+    sides, chosen = plan_positions([1000, 1000], [0, 1800], 500)
+    assert sides == [BOTTOM, TOP]
+    assert chosen == [0, 1000]
+
+
+def test_plan_matches_brute_force_on_random_cases():
+    import random
+
+    rng = random.Random(20260924)
+    for _ in range(200):
+        n = rng.randint(1, 7)
+        top = [rng.randint(0, 5000) for _ in range(n)]
+        bottom = [rng.randint(0, 5000) for _ in range(n)]
+        cost = rng.choice([0, 1, 500, 2000, 10_000])
+        _, expected = _brute_force_optimal(top, bottom, cost)
+        sides, _ = plan_positions(top, bottom, cost)
+        assert sides == expected, (top, bottom, cost, sides, expected)
+
+
+def test_plan_empty():
+    assert plan_positions([], [], 100) == ([], [])
+
+
+# ---------- WebVTT 导出 ----------
+
+def test_render_webvtt_uses_line_setting():
+    cues = [
+        Cue(index="1", start=5000, end=8000, text="第一行"),
+        Cue(index="2", start=10_000, end=12_500, text="第二行上\n第二行下"),
+    ]
+    vtt = render_webvtt(cues, [TOP, BOTTOM])
+    lines = vtt.splitlines()
+    assert lines[0] == "WEBVTT"
+    assert "00:00:05.000 --> 00:00:08.000 line:10%" in vtt
+    assert "00:00:10.000 --> 00:00:12.500 line:90%" in vtt
+    assert vtt.endswith("\n")
+    # 逗号时间分隔符只属于 SRT，WebVTT 必须是句点
+    assert "00:00:05,000" not in vtt
+    # 多行文本保留
+    assert "第二行上\n第二行下" in vtt
+
+
+# ---------- /api/placement ----------
+
+PLACEMENT_SRT = (
+    "1\n00:00:05,000 --> 00:00:09,000\n第一句\n\n"
+    "2\n00:00:10,000 --> 00:00:14,000\n第二句\n\n"
+    "3\n00:00:16,000 --> 00:00:20,000\n第三句\n"
+)
+
+
+def placement_body():
+    return {
+        "srt": PLACEMENT_SRT,
+        # 上方 05–08 与 06–09 重叠，并集为 05–09：第 1 条上方遮挡 4000ms
+        "top_blocks": [
+            {"start": "00:00:05,000", "end": "00:00:08,000"},
+            {"start": "00:00:06,000", "end": "00:00:09,000"},
+            {"start": "00:00:11,000", "end": "00:00:13,000"},
+        ],
+        # 下方 11–19：第 2 条遮挡 3000，第 3 条遮挡 3000
+        "bottom_blocks": [
+            {"start": "00:00:11,000", "end": "00:00:19,000"},
+        ],
+        "switch_cost_ms": 1000,
+    }
+
+
+def test_placement_page_served():
+    resp = client.get("/placement")
+    assert resp.status_code == 200
+    assert "字幕位置规划" in resp.text
+
+
+def test_api_placement_success():
+    resp = client.post("/api/placement", json=placement_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    cues = {c["index"]: c for c in data["cues"]}
+    assert cues["1"]["top_blocked_ms"] == 4000  # 重叠时段先并集再计交集
+    assert cues["1"]["bottom_blocked_ms"] == 0
+    assert cues["2"]["top_blocked_ms"] == 2000
+    assert cues["2"]["bottom_blocked_ms"] == 3000
+    assert cues["3"]["top_blocked_ms"] == 0
+    assert cues["3"]["bottom_blocked_ms"] == 3000
+
+    # 代价对比（第 1 条无前序换位代价）：
+    # 下/下/下：0+3000+3000 = 6000
+    # 下/上/上：0+2000+1000+0 = 3000（换位 1 次）← 最优
+    # 下/上/下：0+2000+1000+3000+1000 = 7000
+    positions = [c["position"] for c in data["cues"]]
+    assert positions == ["bottom", "top", "top"]
+    assert data["total_blocked_ms"] == 2000
+    assert data["switch_count"] == 1
+    assert data["total_switch_cost_ms"] == 1000
+    # 只有第 2 条换到上方后仍被遮挡 2000ms；第 3 条上方无遮挡
+    assert data["occluded_indices"] == ["2"]
+    for c in data["cues"]:
+        assert c["chosen_blocked_ms"] == (
+            c["top_blocked_ms"] if c["position"] == "top" else c["bottom_blocked_ms"]
+        )
+
+    # WebVTT 带 line 位置设置：上方 line:10%，下方 line:90%
+    assert data["webvtt"].startswith("WEBVTT\n\n")
+    assert "00:00:05.000 --> 00:00:09.000 line:90%" in data["webvtt"]
+    assert "00:00:10.000 --> 00:00:14.000 line:10%" in data["webvtt"]
+    assert "第三句" in data["webvtt"]
+
+
+def test_api_placement_bottom_wins_on_exact_tie():
+    body = placement_body()
+    # 换位代价 4000：下/上/上 = 2000+4000 = 6000，与全下 6000 同分 → 优先全下
+    body["switch_cost_ms"] = 4000
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [c["position"] for c in data["cues"]] == [
+        "bottom",
+        "bottom",
+        "bottom",
+    ]
+    assert data["switch_count"] == 0
+    assert data["total_blocked_ms"] == 6000
+    assert data["occluded_indices"] == ["2", "3"]
+
+    # 代价 4001：换位不再划算，仍是全下
+    body["switch_cost_ms"] = 4001
+    resp = client.post("/api/placement", json=body)
+    assert [c["position"] for c in resp.json()["cues"]] == [
+        "bottom",
+        "bottom",
+        "bottom",
+    ]
+
+
+def test_api_placement_zero_cost_switches_freely():
+    body = placement_body()
+    body["switch_cost_ms"] = 0
+    # 各条独立取遮挡更小的一侧：下/上/上
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [c["position"] for c in data["cues"]] == ["bottom", "top", "top"]
+    assert data["switch_count"] == 1
+    assert data["total_switch_cost_ms"] == 0
+    assert data["total_blocked_ms"] == 2000
+    assert data["occluded_indices"] == ["2"]
+
+
+def test_api_placement_empty_blocks_all_bottom():
+    body = {"srt": PLACEMENT_SRT, "top_blocks": [], "bottom_blocks": [], "switch_cost_ms": 0}
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [c["position"] for c in data["cues"]] == ["bottom", "bottom", "bottom"]
+    assert data["occluded_indices"] == []
+    assert data["total_blocked_ms"] == 0
+    assert "line:90%" in data["webvtt"]
+
+
+def test_api_placement_rejects_invalid_block_range():
+    # 结束早于开始
+    body = placement_body()
+    body["top_blocks"] = [{"start": "00:00:10,000", "end": "00:00:09,000"}]
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "blocks"
+
+    # 时间码无法解析
+    body = placement_body()
+    body["bottom_blocks"] = [{"start": "bad", "end": "00:00:09,000"}]
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "blocks"
+
+
+@pytest.mark.parametrize("bad_cost", [-1, -100])
+def test_api_placement_rejects_negative_switch_cost(bad_cost):
+    body = placement_body()
+    body["switch_cost_ms"] = bad_cost
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("bad_cost", [1.5, 1000.0, "1000", True, None])
+def test_api_placement_rejects_non_integer_switch_cost(bad_cost):
+    body = placement_body()
+    body["switch_cost_ms"] = bad_cost
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 422
+
+
+def test_api_placement_zero_cost_accepted():
+    body = placement_body()
+    body["switch_cost_ms"] = 0
+    resp = client.post("/api/placement", json=body)
+    assert resp.status_code == 200, resp.text
+
+
+def test_api_placement_rejects_bad_srt():
+    body = placement_body()
+    body["srt"] = "garbage without timing"
+    resp = client.post("/api/placement", json=body)
     assert resp.status_code == 422
     assert resp.json()["detail"]["type"] == "srt"

@@ -4,128 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>字幕时间漂移校正</title>
-<style>
-  :root {
-    --bg: #f4f6fa;
-    --card: #ffffff;
-    --border: #d9dee8;
-    --text: #1f2733;
-    --muted: #6b7686;
-    --primary: #2563eb;
-    --primary-hover: #1d4ed8;
-    --danger: #dc2626;
-    --danger-bg: #fef2f2;
-    --warn-bg: #fffbeb;
-    --warn-border: #f59e0b;
-    --ok-bg: #f0fdf4;
-    --ok-border: #16a34a;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-  }
-  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 64px; }
-  h1 { font-size: 24px; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 24px; }
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 20px;
-    margin-bottom: 20px;
-  }
-  h2 { font-size: 16px; margin: 0 0 12px; }
-  label { display: block; font-weight: 600; margin-bottom: 6px; }
-  .hint { color: var(--muted); font-weight: 400; font-size: 13px; }
-  textarea {
-    width: 100%;
-    min-height: 220px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    font: 13px/1.6 var(--mono);
-    resize: vertical;
-  }
-  textarea:focus, input:focus { outline: 2px solid rgba(37, 99, 235, .35); border-color: var(--primary); }
-  table.anchors { width: 100%; border-collapse: separate; border-spacing: 0 8px; }
-  table.anchors th {
-    text-align: left;
-    font-size: 13px;
-    color: var(--muted);
-    font-weight: 600;
-    padding: 0 8px 0 0;
-  }
-  table.anchors td { padding: 0; vertical-align: middle; }
-  table.anchors td.time { width: 44%; padding-right: 8px; }
-  table.anchors td.op { width: 40px; text-align: center; color: var(--muted); }
-  table.anchors td.del { width: 44px; text-align: right; }
-  input[type="text"] {
-    width: 100%;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 8px 10px;
-    font: 14px var(--mono);
-  }
-  button {
-    border: 1px solid var(--border);
-    background: #fff;
-    color: var(--text);
-    border-radius: 8px;
-    padding: 8px 16px;
-    font-size: 14px;
-    cursor: pointer;
-  }
-  button:hover { background: #f1f4f9; }
-  button.primary {
-    background: var(--primary);
-    border-color: var(--primary);
-    color: #fff;
-    font-weight: 600;
-    padding: 10px 22px;
-  }
-  button.primary:hover { background: var(--primary-hover); }
-  button.danger-link { border-color: transparent; color: var(--danger); padding: 4px 8px; }
-  button.danger-link:hover { background: var(--danger-bg); }
-  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
-  .alert {
-    border-radius: 8px;
-    padding: 12px 14px;
-    margin-bottom: 16px;
-    font-size: 14px;
-    white-space: pre-wrap;
-  }
-  .alert.error { background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger); }
-  .alert.warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: #92400e; }
-  .alert.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: #166534; }
-  .hidden { display: none; }
-  .preview {
-    width: 100%;
-    min-height: 220px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    font: 13px/1.6 var(--mono);
-    background: #fafbfc;
-    white-space: pre-wrap;
-    overflow-x: auto;
-  }
-  .cues { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
-  .cues th, .cues td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
-  .cues th { background: #f8fafc; }
-  .cues td.num { width: 44px; color: var(--muted); text-align: right; }
-  .cues td.tc { font-family: var(--mono); white-space: nowrap; }
-  .cues .arrow { color: var(--primary); font-weight: 700; }
-</style>
+<link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 <div class="wrap">
   <h1>字幕时间漂移校正</h1>
   <p class="sub">粘贴 SRT 字幕与多组人工确认的「原时间 / 正确时间」锚点，系统按相邻锚点做分段线性映射，锚点外沿用最近区段斜率。</p>
+  <p class="nav"><a href="/placement">字幕位置规划（按画面遮挡选择上/下方并导出 WebVTT）→</a></p>
 
   <div class="card">
     <label for="srt">原始 SRT 字幕</label>
