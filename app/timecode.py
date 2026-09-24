@@ -45,3 +45,8 @@ def format_signed_timecode(ms: int) -> str:
     if ms >= 0:
         return format_timecode(ms)
     return "-" + format_timecode(-ms)
+
+
+def format_vtt_timecode(ms: int) -> str:
+    """把毫秒格式化为 WebVTT 时间码 ``HH:MM:SS.mmm``（负值按 0 处理）。"""
+    return format_timecode(ms).replace(",", ".")

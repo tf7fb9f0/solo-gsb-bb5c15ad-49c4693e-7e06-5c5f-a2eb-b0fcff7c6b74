@@ -1,9 +1,14 @@
-# 字幕时间漂移校正工具
+# 字幕校正与位置规划工具
 
-基于 **Python + FastAPI** 的轻量 Web 工具：粘贴 SRT 字幕，填入多组人工确认的
-「原时间 / 正确时间」锚点，即可校正字幕的时间漂移，在网页预览并下载校正后的 SRT。
+基于 **Python + FastAPI** 的轻量 Web 工具，包含两个功能页面：
 
-## 功能与校正规则
+1. **字幕时间漂移校正**：粘贴 SRT 字幕，填入多组人工确认的「原时间 / 正确时间」
+   锚点，按分段线性映射校正字幕时间，在网页预览并下载校正后的 SRT。
+2. **字幕位置规划**（<http://localhost:8000/placement>）：粘贴 SRT，填写画面上方 /
+   下方被遮挡（台标、弹幕条、滚动新闻等）的时间段与相邻字幕上下换位代价，自动为
+   每条字幕选择总遮挡与换位代价最小的位置，并导出带 `line` 位置设置的 WebVTT。
+
+## 功能与校正规则（时间漂移）
 
 - 粘贴标准 SRT，字幕**序号与文本原样保留**，仅校正开始/结束时间。
 - **无损导出**：直接在原始 SRT 文本上逐条替换时间轴行的起止时间码，
@@ -22,6 +27,26 @@
   （仅当原 SRT 带 BOM 时保留），为 UTF-8 编码。
 - SRT 无法解析时接口仍返回 `422` 错误，并在 `detail.message` 中说明原因。
 
+## 功能与规划规则（字幕位置）
+
+- 输入 SRT（复用同一套字幕解析器）、画面**上方 / 下方各自的遮挡时间段**
+  （`start` / `end`，`HH:MM:SS,mmm`，结束必须严格晚于开始）以及
+  **相邻字幕上下换位代价** `switch_cost_ms`（非负整数，单位毫秒）。
+- **同侧重叠遮挡时段先求并集**（首尾相接也合并），再按并集时段与每条字幕
+  时间区间的交集累计该侧遮挡时长（毫秒）。
+- 以 **总遮挡时长 + 相邻字幕上下换位代价最小** 为目标做动态规划；
+  总代价完全相同时**按字幕顺序逐条优先选择下方**（避免字幕无必要地出现在上方）。
+- 换位代价越大，规划越倾向让整段字幕保持同侧、减少上下跳动；填 `0` 表示
+  换位零成本，每条字幕都选遮挡更短的一侧（同分时下方）。
+- 导出 **WebVTT**（`WEBVTT` 文件头、时间码用句点 `.`），并在每条 cue 的
+  设置中写入行位置：上方 `line:10%`、下方 `line:90%`，可直接用于支持 WebVTT
+  `line` 设置的播放器。
+- 返回逐条的上 / 下选择、两侧遮挡时长、所选位置的遮挡时长，以及
+  **所选位置仍被遮挡的字幕列表** `still_occluded_cues`（两侧同时遮挡时出现），
+  页面中高亮提示并可一键下载 `placement.vtt`。
+- 遮挡时间段起止无效（格式错误或结束不晚于开始）、换位代价不是非负整数、
+  SRT 无法解析时，接口均返回 `422`，并在 `detail.message` 中给出中文原因。
+
 ## 一条命令启动（Docker Compose）
 
 ```bash
@@ -30,7 +55,8 @@ docker compose up -d --build
 
 启动后访问：
 
-- 工具界面：<http://localhost:8000/>
+- 时间漂移校正界面：<http://localhost:8000/>
+- 字幕位置规划界面：<http://localhost:8000/placement>
 - 健康检查：<http://localhost:8000/health>
 - 接口文档（FastAPI 自带）：<http://localhost:8000/docs>
 
@@ -47,7 +73,7 @@ docker compose up -d --build
 
 ```bash
 HOST_PORT=9000 docker compose up -d --build
-# 访问 http://localhost:9000/
+# 访问 http://localhost:9000/ 与 http://localhost:9000/placement
 ```
 
 ## 不用 Docker，直接运行（Python 3.10+）
@@ -57,11 +83,11 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-同样访问 <http://localhost:8000/>。
+同样访问 <http://localhost:8000/> 与 <http://localhost:8000/placement>。
 
 ## HTTP 接口
 
-`POST /api/correct`
+### `POST /api/correct`
 
 ```json
 {
@@ -78,17 +104,48 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 （逐条前后时间对照）与 `warnings`（如时间截断等提示）。SRT 解析失败或锚点不
 满足严格递增时返回 `422`，并在 `detail.message` 中给出中文原因。
 
+### `POST /api/placement`
+
+```json
+{
+  "srt": "1\n00:00:05,000 --> 00:00:09,000\n第一句\n\n2\n00:00:14,000 --> 00:00:18,000\n第二句\n",
+  "top_blocks": [
+    {"start": "00:00:12,000", "end": "00:00:20,000"}
+  ],
+  "bottom_blocks": [
+    {"start": "00:00:24,000", "end": "00:00:32,000"}
+  ],
+  "switch_cost_ms": 2000
+}
+```
+
+`top_blocks` / `bottom_blocks` 均可省略或传空数组（表示该侧全程无遮挡）。
+成功返回：
+
+- `vtt`：带 `line:10%` / `line:90%` 行位置设置的完整 WebVTT 文本；
+- `cues`：逐条字幕的 `position`（`top` / `bottom`）、`top_occluded_ms`、
+  `bottom_occluded_ms`、所选位置遮挡 `occluded_ms` 及 `still_occluded` 标记；
+- `still_occluded_cues`：所选位置仍被遮挡的字幕（两侧同时遮挡时才可能出现）；
+- `merged_top_blocks` / `merged_bottom_blocks`：两侧遮挡求并集后的时间段
+  （`HH:MM:SS,mmm`），便于页面核对；
+- `total_occluded_ms`：所选位置的遮挡总毫秒数；`switch_count`：上下换位次数。
+
+时间段起止无效或 `switch_cost_ms` 不是非负整数时返回 `422`
+（后者为请求体校验错误，前者与 SRT 解析错误在 `detail.message` 中给出中文原因）。
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用与 /api/correct 接口
+│   ├── main.py          # FastAPI 应用、/api/correct 与 /api/placement 接口
 │   ├── mapping.py       # 锚点校验与分段线性映射
+│   ├── placement.py     # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
 │   ├── srt.py           # SRT 解析与无损重写（仅替换时间码，保留原格式）
-│   ├── timecode.py      # 时间码解析与格式化
+│   ├── timecode.py      # 时间码解析与格式化（SRT / WebVTT）
 │   └── static/
-│       └── index.html   # 轻量网页界面（原生 HTML/CSS/JS）
+│       ├── index.html       # 时间漂移校正页面（原生 HTML/CSS/JS）
+│       └── placement.html   # 字幕位置规划页面（原生 HTML/CSS/JS）
 ├── tests/               # 核心算法与接口测试
 ├── Dockerfile
 ├── docker-compose.yml
